@@ -6,23 +6,27 @@
  * Purpose: Comprehensive AVC audit and SELinux policy query guard
  */
 
+/* kpmodule.h uses __user but doesn't define it — define first */
+#ifndef __user
+#define __user __attribute__((noderef, address_space(1)))
+#endif
+
 #include <kpmodule.h>
 #include <hook.h>
 #include <linux/printk.h>
-#include <linux/syscall.h>
-#include <linux/uaccess.h>
-#include <linux/fs.h>
-#include <linux/audit.h>
+#include <syscall.h>          /* KernelPatch syscall.h: fp_hook_syscalln, etc. */
+#include <uaccess.h>          /* KernelPatch uaccess.h: compat_copy_to_user */
 #include <kallsyms.h>
 #include <linux/slab.h>
 #include <preset.h>
+#include <linux/string.h>   /* strlen, strcmp, memcmp, strchr, memset */
 
 /* ============================================================================
  * KernelPatch stripped headers forward-declare struct path / struct file.
  * Provide minimal ABI-compatible definitions for Linux 4.14 arm64.
  * ============================================================================ */
 
-struct vfsmount; /* d_path only dereferences internally; opaque here is fine */
+struct vfsmount;
 struct dentry;
 
 struct path {
@@ -33,7 +37,6 @@ struct path {
 struct file {
     char __f_u_pad[16]; /* union f_u: rcu_head is largest at 16 bytes */
     struct path f_path;
-    /* Members beyond f_path are not accessed by this module */
 };
 
 /* KernelPatch headers lack stdio prototypes; declare manually */
@@ -51,6 +54,44 @@ int snprintf(char *buf, size_t size, const char *fmt, ...);
 #endif
 #ifndef ENODATA
 #define ENODATA 61
+#endif
+
+/* Syscall numbers for Linux 4.14 arm64 (asm-generic/unistd.h) */
+#ifndef __NR_read
+#define __NR_read 63
+#endif
+#ifndef __NR_write
+#define __NR_write 64
+#endif
+#ifndef __NR_readv
+#define __NR_readv 65
+#endif
+#ifndef __NR_writev
+#define __NR_writev 66
+#endif
+#ifndef __NR_pread64
+#define __NR_pread64 67
+#endif
+#ifndef __NR_pwrite64
+#define __NR_pwrite64 68
+#endif
+#ifndef __NR_preadv
+#define __NR_preadv 69
+#endif
+#ifndef __NR_pwritev
+#define __NR_pwritev 70
+#endif
+#ifndef __NR_recvmsg
+#define __NR_recvmsg 211
+#endif
+#ifndef __NR_getxattr
+#define __NR_getxattr 8
+#endif
+#ifndef __NR_lgetxattr
+#define __NR_lgetxattr 9
+#endif
+#ifndef __NR_fgetxattr
+#define __NR_fgetxattr 10
 #endif
 
 /* ============================================================================
@@ -383,8 +424,8 @@ static void before_audit_log_start(hook_fargs3_t *args, void *udata)
 static void after_read(hook_fargs3_t *args, void *udata)
 {
     ssize_t ret = (ssize_t)args->ret;
-    int fd = (int)syscall_argn(args, 0);
-    char __user *buf = (char __user *)syscall_argn(args, 1);
+    int fd = (int)args->arg0;
+    char __user *buf = (char __user *)args->arg1;
     if (ret > 0 && is_log_source_fd(fd))
         sanitize_buffer(buf, ret);
 }
@@ -392,8 +433,8 @@ static void after_read(hook_fargs3_t *args, void *udata)
 static void after_pread64(hook_fargs3_t *args, void *udata)
 {
     ssize_t ret = (ssize_t)args->ret;
-    int fd = (int)syscall_argn(args, 0);
-    char __user *buf = (char __user *)syscall_argn(args, 1);
+    int fd = (int)args->arg0;
+    char __user *buf = (char __user *)args->arg1;
     if (ret > 0 && is_log_source_fd(fd))
         sanitize_buffer(buf, ret);
 }
@@ -401,9 +442,9 @@ static void after_pread64(hook_fargs3_t *args, void *udata)
 static void after_readv(hook_fargs3_t *args, void *udata)
 {
     ssize_t ret = (ssize_t)args->ret;
-    int fd = (int)syscall_argn(args, 0);
-    struct kpm_iovec __user *uiov = (struct kpm_iovec __user *)syscall_argn(args, 1);
-    int iovcnt = (int)syscall_argn(args, 2);
+    int fd = (int)args->arg0;
+    struct kpm_iovec __user *uiov = (struct kpm_iovec __user *)args->arg1;
+    int iovcnt = (int)args->arg2;
     struct kpm_iovec kiov;
     int i;
 
@@ -429,7 +470,7 @@ static void after_recvmsg(hook_fargs3_t *args, void *udata)
     if (ret <= 0) return;
     if (!fn_copy_from_user) return;
 
-    umsg = (struct kpm_msghdr __user *)syscall_argn(args, 1);
+    umsg = (struct kpm_msghdr __user *)args->arg1;
     if (!umsg) return;
 
     if (fn_copy_from_user(&kmsg, umsg, sizeof(kmsg))) return;
@@ -453,9 +494,9 @@ static void after_recvmsg(hook_fargs3_t *args, void *udata)
 
 static void before_write(hook_fargs3_t *args, void *udata)
 {
-    int fd = (int)syscall_argn(args, 0);
-    const char __user *ubuf = (const char __user *)syscall_argn(args, 1);
-    size_t count = (size_t)syscall_argn(args, 2);
+    int fd = (int)args->arg0;
+    const char __user *ubuf = (const char __user *)args->arg1;
+    size_t count = (size_t)args->arg2;
     char kbuf[QUERY_BUF_MAX];
     size_t copy_len;
     unsigned long not_copied;
@@ -477,9 +518,9 @@ static void before_write(hook_fargs3_t *args, void *udata)
 
 static void before_writev(hook_fargs3_t *args, void *udata)
 {
-    int fd = (int)syscall_argn(args, 0);
-    struct kpm_iovec __user *uiov = (struct kpm_iovec __user *)syscall_argn(args, 1);
-    int iovcnt = (int)syscall_argn(args, 2);
+    int fd = (int)args->arg0;
+    struct kpm_iovec __user *uiov = (struct kpm_iovec __user *)args->arg1;
+    int iovcnt = (int)args->arg2;
     struct kpm_iovec kiov;
     char kbuf[QUERY_BUF_MAX];
     size_t copy_len;
@@ -519,8 +560,8 @@ static void before_writev(hook_fargs3_t *args, void *udata)
 
 static void before_getxattr(hook_fargs4_t *args, void *udata)
 {
-    const char __user *upath = (const char __user *)syscall_argn(args, 0);
-    const char __user *uname = (const char __user *)syscall_argn(args, 1);
+    const char __user *upath = (const char __user *)args->arg0;
+    const char __user *uname = (const char __user *)args->arg1;
     char name_buf[32] = {0};
     char path_buf[256] = {0};
 
@@ -538,8 +579,8 @@ static void before_getxattr(hook_fargs4_t *args, void *udata)
 
 static void before_lgetxattr(hook_fargs4_t *args, void *udata)
 {
-    const char __user *upath = (const char __user *)syscall_argn(args, 0);
-    const char __user *uname = (const char __user *)syscall_argn(args, 1);
+    const char __user *upath = (const char __user *)args->arg0;
+    const char __user *uname = (const char __user *)args->arg1;
     char name_buf[32] = {0};
     char path_buf[256] = {0};
 
@@ -557,8 +598,8 @@ static void before_lgetxattr(hook_fargs4_t *args, void *udata)
 
 static void before_fgetxattr(hook_fargs4_t *args, void *udata)
 {
-    int fd = (int)syscall_argn(args, 0);
-    const char __user *uname = (const char __user *)syscall_argn(args, 1);
+    int fd = (int)args->arg0;
+    const char __user *uname = (const char __user *)args->arg1;
     char name_buf[32] = {0};
     char path_buf[256];
     char *path_ptr;
