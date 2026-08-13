@@ -4,13 +4,6 @@
  *
  * Target:  Linux 4.14 arm64 (MT6893 / chopin_kvm)
  * Purpose: Comprehensive AVC audit and SELinux policy query guard
- *
- * Layers:
- *   L1: hook_wrap audit_log_start → block AVC type 1400/1107
- *   L2: fp_hook read/pread64/readv → sanitize log buffers
- *   L3: fp_hook write/writev → intercept selinuxfs policy queries
- *
- * Built against: SukiSU-Ultra/SukiSU_KernelPatch_patch
  */
 
 #include <compiler.h>
@@ -22,11 +15,12 @@
 #include <log.h>
 #include <linux/printk.h>
 #include <linux/string.h>
+#include <linux/fs.h>
 #include <uapi/asm-generic/unistd.h>
 
 /* KPM metadata */
 KPM_NAME("avc_guard");
-KPM_VERSION("2.0.0");
+KPM_VERSION("2.2.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("ai-assisted");
 KPM_DESCRIPTION("Comprehensive AVC and SELinux policy query guard");
@@ -41,30 +35,62 @@ KPM_DESCRIPTION("Comprehensive AVC and SELinux policy query guard");
 #ifndef AUDIT_USER_AVC
 #define AUDIT_USER_AVC   1107
 #endif
+#ifndef ENODATA
+#define ENODATA          61
+#endif
 
-/* kfunc declarations */
+/* ═══════════════════════════════════════════════════════════════════
+ *  kfunc declarations + aliases
+ *  kfunc_def(func) expands to (*kf_func), so we alias back to func
+ *  ═══════════════════════════════════════════════════════════════════ */
+
 struct audit_buffer;
 struct audit_context;
-struct file;
-struct path;
 
 struct audit_buffer *kfunc_def(audit_log_start)(struct audit_context *ctx,
                                                 unsigned int gfp_mask,
                                                 int type);
+#define audit_log_start kf_audit_log_start
+
 struct file *kfunc_def(fget)(unsigned int fd);
+#define fget kf_fget
+
 void kfunc_def(fput)(struct file *file);
+#define fput kf_fput
+
 char *kfunc_def(d_path)(const struct path *path, char *buf, int buflen);
+#define d_path kf_d_path
+
 unsigned long kfunc_def(copy_from_user)(void *to, const void __user *from,
                                         unsigned long n);
+#define copy_from_user kf_copy_from_user
+
 unsigned long kfunc_def(copy_to_user)(void __user *to, const void *from,
                                       unsigned long n);
-void *kfunc_def(kmalloc)(size_t size, unsigned int flags);
-void kfunc_def(kfree)(const void *ptr);
+#define copy_to_user kf_copy_to_user
 
-/* iovec for readv/writev */
+void *kfunc_def(kmalloc)(size_t size, unsigned int flags);
+#define kmalloc kf_kmalloc
+
+void kfunc_def(kfree)(const void *ptr);
+#define kfree kf_kfree
+
+/* iovec */
 struct kpm_iovec {
     void __user *iov_base;
     size_t iov_len;
+};
+
+/* msghdr for recvmsg (arm64 layout) */
+struct kpm_msghdr {
+    void __user *msg_name;
+    int msg_namelen;
+    int __pad0;
+    struct kpm_iovec __user *msg_iov;
+    unsigned long msg_iovlen;
+    void __user *msg_control;
+    unsigned long msg_controllen;
+    unsigned int msg_flags;
 };
 
 #define KPM_UIO_MAXIOV 1024
@@ -75,7 +101,6 @@ struct kpm_iovec {
  *  Dirty context / keyword / path tables
  *  ═══════════════════════════════════════════════════════════════════ */
 
-/* SELinux contexts that detectors query to discover root */
 static const char *dirty_contexts[] = {
     "u:r:ksu", "u:r:su", "u:r:magisk", "u:r:lsposed", "u:r:zygisk",
     "u:r:apatch", "u:r:sukisu", "u:r:supersu", "u:r:root",
@@ -85,7 +110,6 @@ static const char *dirty_contexts[] = {
     NULL
 };
 
-/* Keywords appearing in AVC logs and kernel messages */
 static const char *sensitive_keywords[] = {
     "avc: denied",
     "u:r:ksu", "u:r:su", "u:r:magisk", "u:r:lsposed", "u:r:zygisk",
@@ -93,15 +117,14 @@ static const char *sensitive_keywords[] = {
     "u:object_r:magisk", "u:object_r:ksu", "u:object_r:lsposed",
     "u:object_r:zygisk", "u:object_r:apatch", "u:object_r:sukisu",
     "magisk", "lsposed", "zygisk", "apatch", "sukisu", "supersu",
-    "kernelsu", "kpm", "kernelpatch", "kpimg", "kptools",
+    "kernelsu", "kernelpatch", "kpimg", "kptools",
     "magiskd", "magiskpolicy", "supolicy", "ksud", "apd", "kpatchd",
     "lspd", "zygisksu", "susfs", "tricky_store", "nohello",
-    "fusefixer", "hidethanox", "hma_oss", "chunqiuziyuan", "春秋",
+    "fusefixer", "hidethanox", "hma_oss", "chunqiuziyuan",
     "selinux: denied",
     NULL
 };
 
-/* Log source file paths */
 static const char *log_source_paths[] = {
     "/proc/kmsg", "/dev/kmsg", "/dev/main", "/dev/event-log-tags",
     "/sys/kernel/debug/tracing/trace",
@@ -116,7 +139,6 @@ static const char *log_source_basenames[] = {
     NULL
 };
 
-/* SELinux policy query file paths */
 static const char *selinux_query_paths[] = {
     "/sys/fs/selinux/access",
     "/sys/fs/selinux/context",
@@ -134,10 +156,12 @@ static const char *selinux_query_basenames[] = {
     NULL
 };
 
-/* File path keywords that reveal root environment */
-static const char *sensitive_paths[] = {
-    "/data/adb", "/data/adb/ksu", "/data/adb/modules",
-    "/system/bin/su", "/system/xbin/su", "/sbin/su",
+static const char *adb_paths[] = {
+    "/data/adb",
+    "/data/adb/ksu",
+    "/data/adb/modules",
+    "/system/bin/su",
+    "/system/xbin/su",
     NULL
 };
 
@@ -148,8 +172,14 @@ static bool g_l1_ok = false;
 static bool g_l2_read_ok = false;
 static bool g_l2_pread64_ok = false;
 static bool g_l2_readv_ok = false;
+static bool g_l2_preadv_ok = false;
+static bool g_l2_recvmsg_ok = false;
 static bool g_l3_write_ok = false;
 static bool g_l3_writev_ok = false;
+static bool g_l3_pwritev_ok = false;
+static bool g_l4_getxattr_ok = false;
+static bool g_l4_lgetxattr_ok = false;
+static bool g_l4_fgetxattr_ok = false;
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Common helpers
@@ -242,6 +272,16 @@ out:
     return hit;
 }
 
+static bool is_sensitive_adb_path(const char *path)
+{
+    int i;
+    for (i = 0; adb_paths[i]; i++) {
+        if (kstrnstr(path, adb_paths[i], 256))
+            return true;
+    }
+    return false;
+}
+
 static bool contains_dirty_context(const char *buf, size_t len)
 {
     int i;
@@ -272,7 +312,6 @@ static void sanitize_buffer(char __user *user_buf, ssize_t len)
     char *p, *end;
     bool dirty = false;
     unsigned long not_copied;
-    size_t copy_len;
 
     if (len <= 0 || len > SANITIZE_MAX_LEN) return;
     if (!kmalloc || !kfree || !copy_from_user || !copy_to_user) return;
@@ -320,7 +359,7 @@ static void sanitize_buffer(char __user *user_buf, ssize_t len)
 
 static void before_audit_log_start(hook_fargs3_t *args, void *udata)
 {
-    int type = (int)args->arg2;  /* inline hook: direct arg access */
+    int type = (int)args->arg2;
     if (type == AUDIT_AVC || type == AUDIT_USER_AVC) {
         args->skip_origin = 1;
         args->ret = (uint64_t)NULL;
@@ -328,7 +367,7 @@ static void before_audit_log_start(hook_fargs3_t *args, void *udata)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- *  Layer 2: read / pread64 / readv hooks
+ *  Layer 2: read / pread64 / readv / preadv / recvmsg hooks
  *  ═══════════════════════════════════════════════════════════════════ */
 
 static void after_read(hook_fargs3_t *args, void *udata)
@@ -360,6 +399,7 @@ static void after_readv(hook_fargs3_t *args, void *udata)
 
     if (ret <= 0 || !is_log_source_fd(fd)) return;
     if (!uiov || iovcnt <= 0) return;
+    if (!copy_from_user) return;
 
     for (i = 0; i < iovcnt && i < KPM_UIO_MAXIOV; i++) {
         if (copy_from_user(&kiov, &uiov[i], sizeof(kiov))) continue;
@@ -368,8 +408,37 @@ static void after_readv(hook_fargs3_t *args, void *udata)
     }
 }
 
+static void after_recvmsg(hook_fargs3_t *args, void *udata)
+{
+    ssize_t ret = (ssize_t)args->ret;
+    struct kpm_msghdr __user *umsg;
+    struct kpm_msghdr kmsg;
+    struct kpm_iovec kiov;
+    int i;
+
+    if (ret <= 0) return;
+    if (!copy_from_user) return;
+
+    umsg = (struct kpm_msghdr __user *)syscall_argn(args, 1);
+    if (!umsg) return;
+
+    if (copy_from_user(&kmsg, umsg, sizeof(kmsg))) return;
+    if (!kmsg.msg_iov || kmsg.msg_iovlen == 0) return;
+
+    for (i = 0; i < (int)kmsg.msg_iovlen && i < KPM_UIO_MAXIOV; i++) {
+        if (copy_from_user(&kiov, &kmsg.msg_iov[i], sizeof(kiov))) continue;
+        if (!kiov.iov_base || kiov.iov_len == 0) continue;
+
+        char quick[256];
+        size_t quick_len = kiov.iov_len < sizeof(quick) ? kiov.iov_len : sizeof(quick);
+        if (copy_from_user(quick, kiov.iov_base, quick_len)) continue;
+        if (contains_sensitive(quick, quick_len))
+            sanitize_buffer(kiov.iov_base, (ssize_t)kiov.iov_len);
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════════
- *  Layer 3: write / writev hooks
+ *  Layer 3: write / writev / pwritev hooks
  *  ═══════════════════════════════════════════════════════════════════ */
 
 static void before_write(hook_fargs3_t *args, void *udata)
@@ -392,8 +461,7 @@ static void before_write(hook_fargs3_t *args, void *udata)
 
     if (contains_dirty_context(kbuf, copy_len)) {
         args->skip_origin = 1;
-        args->ret = (uint64_t)count;  /* pretend success, no-op */
-        logkd("avc_guard: L3 blocked write fd=%d cnt=%zu\n", fd, count);
+        args->ret = (uint64_t)count;
     }
 }
 
@@ -406,6 +474,8 @@ static void before_writev(hook_fargs3_t *args, void *udata)
     char kbuf[QUERY_BUF_MAX];
     size_t copy_len;
     unsigned long not_copied;
+    size_t total = 0;
+    bool blocked = false;
     int i;
 
     if (fd <= 2 || !uiov || iovcnt <= 0) return;
@@ -414,19 +484,90 @@ static void before_writev(hook_fargs3_t *args, void *udata)
 
     for (i = 0; i < iovcnt && i < KPM_UIO_MAXIOV; i++) {
         if (copy_from_user(&kiov, &uiov[i], sizeof(kiov))) continue;
-        if (!kiov.iov_base || kiov.iov_len < 5) continue;
+        if (kiov.iov_base && kiov.iov_len > 0)
+            total += kiov.iov_len;
 
-        copy_len = (kiov.iov_len < QUERY_BUF_MAX - 1) ? kiov.iov_len : QUERY_BUF_MAX - 1;
-        not_copied = copy_from_user(kbuf, kiov.iov_base, copy_len);
-        if (not_copied) continue;
-        kbuf[copy_len] = '\0';
-
-        if (contains_dirty_context(kbuf, copy_len)) {
-            args->skip_origin = 1;
-            args->ret = (uint64_t)syscall_argn(args, 2);  /* pretend all written */
-            logkd("avc_guard: L3 blocked writev fd=%d iov=%d\n", fd, i);
-            return;
+        if (!blocked && kiov.iov_base && kiov.iov_len >= 5) {
+            copy_len = (kiov.iov_len < QUERY_BUF_MAX - 1) ? kiov.iov_len : QUERY_BUF_MAX - 1;
+            not_copied = copy_from_user(kbuf, kiov.iov_base, copy_len);
+            if (not_copied) continue;
+            kbuf[copy_len] = '\0';
+            if (contains_dirty_context(kbuf, copy_len))
+                blocked = true;
         }
+    }
+
+    if (blocked) {
+        args->skip_origin = 1;
+        args->ret = (uint64_t)total;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  Layer 4: getxattr / lgetxattr / fgetxattr hooks
+ *  ═══════════════════════════════════════════════════════════════════ */
+
+static void before_getxattr(hook_fargs4_t *args, void *udata)
+{
+    const char __user *upath = (const char __user *)syscall_argn(args, 0);
+    const char __user *uname = (const char __user *)syscall_argn(args, 1);
+    char name_buf[32] = {0};
+    char path_buf[256] = {0};
+
+    if (!upath || !uname || !copy_from_user) return;
+
+    if (copy_from_user(name_buf, uname, sizeof(name_buf) - 1) != 0) return;
+    if (strcmp(name_buf, "security.selinux") != 0) return;
+
+    if (copy_from_user(path_buf, upath, sizeof(path_buf) - 1) != 0) return;
+    if (!is_sensitive_adb_path(path_buf)) return;
+
+    args->skip_origin = 1;
+    args->ret = (uint64_t)-ENODATA;
+}
+
+static void before_lgetxattr(hook_fargs4_t *args, void *udata)
+{
+    const char __user *upath = (const char __user *)syscall_argn(args, 0);
+    const char __user *uname = (const char __user *)syscall_argn(args, 1);
+    char name_buf[32] = {0};
+    char path_buf[256] = {0};
+
+    if (!upath || !uname || !copy_from_user) return;
+
+    if (copy_from_user(name_buf, uname, sizeof(name_buf) - 1) != 0) return;
+    if (strcmp(name_buf, "security.selinux") != 0) return;
+
+    if (copy_from_user(path_buf, upath, sizeof(path_buf) - 1) != 0) return;
+    if (!is_sensitive_adb_path(path_buf)) return;
+
+    args->skip_origin = 1;
+    args->ret = (uint64_t)-ENODATA;
+}
+
+static void before_fgetxattr(hook_fargs4_t *args, void *udata)
+{
+    int fd = (int)syscall_argn(args, 0);
+    const char __user *uname = (const char __user *)syscall_argn(args, 1);
+    char name_buf[32] = {0};
+    char path_buf[256];
+    char *path_ptr;
+    struct file *file;
+
+    if (fd <= 2 || !uname || !copy_from_user || !fget || !fput || !d_path)
+        return;
+
+    if (copy_from_user(name_buf, uname, sizeof(name_buf) - 1) != 0) return;
+    if (strcmp(name_buf, "security.selinux") != 0) return;
+
+    file = fget(fd);
+    if (!file) return;
+    path_ptr = d_path(&file->f_path, path_buf, sizeof(path_buf));
+    fput(file);
+
+    if (path_ptr && is_sensitive_adb_path(path_ptr)) {
+        args->skip_origin = 1;
+        args->ret = (uint64_t)-ENODATA;
     }
 }
 
@@ -439,9 +580,8 @@ static long avc_guard_init(const char *args, const char *event,
 {
     hook_err_t err;
 
-    logkd("avc_guard: v2.0.0 init (kpver=%x kver=%x)\n", kpver, kver);
+    logkd("avc_guard: v2.2.1 init (kpver=%x kver=%x)\n", kpver, kver);
 
-    /* Resolve kfuncs */
     if (!audit_log_start)
         audit_log_start = (void *)kallsyms_lookup_name("audit_log_start");
     if (!fget) fget = (void *)kallsyms_lookup_name("fget");
@@ -454,7 +594,7 @@ static long avc_guard_init(const char *args, const char *event,
     if (!kmalloc) kmalloc = (void *)kallsyms_lookup_name("kmalloc");
     if (!kfree) kfree = (void *)kallsyms_lookup_name("kfree");
 
-    /* L1: audit_log_start */
+    /* L1 */
     if (audit_log_start) {
         err = hook_wrap3(audit_log_start, before_audit_log_start, NULL, 0);
         if (err == HOOK_NO_ERR) {
@@ -467,7 +607,7 @@ static long avc_guard_init(const char *args, const char *event,
         logkw("avc_guard: L1 audit_log_start not found\n");
     }
 
-    /* L2: read syscalls */
+    /* L2 */
     err = fp_hook_syscalln(__NR_read, 3, NULL, after_read, 0);
     if (err == HOOK_NO_ERR) { g_l2_read_ok = true; logkd("avc_guard: L2 read hooked\n"); }
     else logkw("avc_guard: L2 read hook failed err=%d\n", err);
@@ -480,7 +620,15 @@ static long avc_guard_init(const char *args, const char *event,
     if (err == HOOK_NO_ERR) { g_l2_readv_ok = true; logkd("avc_guard: L2 readv hooked\n"); }
     else logkw("avc_guard: L2 readv hook failed err=%d\n", err);
 
-    /* L3: write syscalls */
+    err = fp_hook_syscalln(__NR_preadv, 4, NULL, after_readv, 0);
+    if (err == HOOK_NO_ERR) { g_l2_preadv_ok = true; logkd("avc_guard: L2 preadv hooked\n"); }
+    else logkw("avc_guard: L2 preadv hook failed err=%d\n", err);
+
+    err = fp_hook_syscalln(__NR_recvmsg, 3, NULL, after_recvmsg, 0);
+    if (err == HOOK_NO_ERR) { g_l2_recvmsg_ok = true; logkd("avc_guard: L2 recvmsg hooked\n"); }
+    else logkw("avc_guard: L2 recvmsg hook failed err=%d\n", err);
+
+    /* L3 */
     err = fp_hook_syscalln(__NR_write, 3, before_write, NULL, 0);
     if (err == HOOK_NO_ERR) { g_l3_write_ok = true; logkd("avc_guard: L3 write hooked\n"); }
     else logkw("avc_guard: L3 write hook failed err=%d\n", err);
@@ -489,13 +637,36 @@ static long avc_guard_init(const char *args, const char *event,
     if (err == HOOK_NO_ERR) { g_l3_writev_ok = true; logkd("avc_guard: L3 writev hooked\n"); }
     else logkw("avc_guard: L3 writev hook failed err=%d\n", err);
 
-    logkd("avc_guard: init done L1=%s L2r=%s L2p=%s L2v=%s L3w=%s L3v=%s\n",
+    err = fp_hook_syscalln(__NR_pwritev, 4, before_writev, NULL, 0);
+    if (err == HOOK_NO_ERR) { g_l3_pwritev_ok = true; logkd("avc_guard: L3 pwritev hooked\n"); }
+    else logkw("avc_guard: L3 pwritev hook failed err=%d\n", err);
+
+    /* L4 */
+    err = fp_hook_syscalln(__NR_getxattr, 4, before_getxattr, NULL, 0);
+    if (err == HOOK_NO_ERR) { g_l4_getxattr_ok = true; logkd("avc_guard: L4 getxattr hooked\n"); }
+    else logkw("avc_guard: L4 getxattr hook failed err=%d\n", err);
+
+    err = fp_hook_syscalln(__NR_lgetxattr, 4, before_lgetxattr, NULL, 0);
+    if (err == HOOK_NO_ERR) { g_l4_lgetxattr_ok = true; logkd("avc_guard: L4 lgetxattr hooked\n"); }
+    else logkw("avc_guard: L4 lgetxattr hook failed err=%d\n", err);
+
+    err = fp_hook_syscalln(__NR_fgetxattr, 4, before_fgetxattr, NULL, 0);
+    if (err == HOOK_NO_ERR) { g_l4_fgetxattr_ok = true; logkd("avc_guard: L4 fgetxattr hooked\n"); }
+    else logkw("avc_guard: L4 fgetxattr hook failed err=%d\n", err);
+
+    logkd("avc_guard: init done L1=%s L2r=%s L2p=%s L2v=%s L2pv=%s L2m=%s L3w=%s L3v=%s L3pv=%s L4g=%s L4l=%s L4f=%s\n",
           g_l1_ok ? "OK" : "FAIL",
           g_l2_read_ok ? "OK" : "FAIL",
           g_l2_pread64_ok ? "OK" : "FAIL",
           g_l2_readv_ok ? "OK" : "FAIL",
+          g_l2_preadv_ok ? "OK" : "FAIL",
+          g_l2_recvmsg_ok ? "OK" : "FAIL",
           g_l3_write_ok ? "OK" : "FAIL",
-          g_l3_writev_ok ? "OK" : "FAIL");
+          g_l3_writev_ok ? "OK" : "FAIL",
+          g_l3_pwritev_ok ? "OK" : "FAIL",
+          g_l4_getxattr_ok ? "OK" : "FAIL",
+          g_l4_lgetxattr_ok ? "OK" : "FAIL",
+          g_l4_fgetxattr_ok ? "OK" : "FAIL");
 
     return 0;
 }
@@ -503,24 +674,36 @@ static long avc_guard_init(const char *args, const char *event,
 static long avc_guard_control0(const char *args, char *__user out_msg,
                                int outlen)
 {
-    char msg[256];
+    char msg[384];
     int len;
     size_t copy_len;
 
     len = snprintf(msg, sizeof(msg),
-                   "avc_guard v2.0.0 status:\n"
+                   "avc_guard v2.2.1 status:\n"
                    "  L1 audit_log_start : %s\n"
                    "  L2 read            : %s\n"
                    "  L2 pread64         : %s\n"
                    "  L2 readv           : %s\n"
+                   "  L2 preadv          : %s\n"
+                   "  L2 recvmsg         : %s\n"
                    "  L3 write           : %s\n"
-                   "  L3 writev          : %s\n",
+                   "  L3 writev          : %s\n"
+                   "  L3 pwritev         : %s\n"
+                   "  L4 getxattr        : %s\n"
+                   "  L4 lgetxattr       : %s\n"
+                   "  L4 fgetxattr       : %s\n",
                    g_l1_ok ? "OK" : "FAIL",
                    g_l2_read_ok ? "OK" : "FAIL",
                    g_l2_pread64_ok ? "OK" : "FAIL",
                    g_l2_readv_ok ? "OK" : "FAIL",
+                   g_l2_preadv_ok ? "OK" : "FAIL",
+                   g_l2_recvmsg_ok ? "OK" : "FAIL",
                    g_l3_write_ok ? "OK" : "FAIL",
-                   g_l3_writev_ok ? "OK" : "FAIL");
+                   g_l3_writev_ok ? "OK" : "FAIL",
+                   g_l3_pwritev_ok ? "OK" : "FAIL",
+                   g_l4_getxattr_ok ? "OK" : "FAIL",
+                   g_l4_lgetxattr_ok ? "OK" : "FAIL",
+                   g_l4_fgetxattr_ok ? "OK" : "FAIL");
 
     if (out_msg && outlen > 0) {
         copy_len = (size_t)(len + 1) < (size_t)outlen ? (size_t)(len + 1) : (size_t)outlen;
@@ -542,11 +725,24 @@ static long avc_guard_exit(void *__user reserved)
         fp_unhook_syscalln(__NR_pread64, NULL, after_pread64);
     if (g_l2_readv_ok)
         fp_unhook_syscalln(__NR_readv, NULL, after_readv);
+    if (g_l2_preadv_ok)
+        fp_unhook_syscalln(__NR_preadv, NULL, after_readv);
+    if (g_l2_recvmsg_ok)
+        fp_unhook_syscalln(__NR_recvmsg, NULL, after_recvmsg);
 
     if (g_l3_write_ok)
         fp_unhook_syscalln(__NR_write, before_write, NULL);
     if (g_l3_writev_ok)
         fp_unhook_syscalln(__NR_writev, before_writev, NULL);
+    if (g_l3_pwritev_ok)
+        fp_unhook_syscalln(__NR_pwritev, before_writev, NULL);
+
+    if (g_l4_getxattr_ok)
+        fp_unhook_syscalln(__NR_getxattr, before_getxattr, NULL);
+    if (g_l4_lgetxattr_ok)
+        fp_unhook_syscalln(__NR_lgetxattr, before_lgetxattr, NULL);
+    if (g_l4_fgetxattr_ok)
+        fp_unhook_syscalln(__NR_fgetxattr, before_fgetxattr, NULL);
 
     return 0;
 }
