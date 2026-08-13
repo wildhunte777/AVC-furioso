@@ -761,6 +761,12 @@ static long avc_guard_exit(void *__user reserved)
     return 0;
 }
 
+KPM_NAME("avc_guard");
+KPM_VERSION("2.2.1");
+KPM_AUTHOR("ai-assisted");
+KPM_LICENSE("GPL-2.0-or-later");
+KPM_DESCRIPTION("SELinux/AVC audit log sanitization for SukiSU");
+
 KPM_INIT(avc_guard_init);
 KPM_CTL0(avc_guard_control0);
 KPM_EXIT(avc_guard_exit);
