@@ -4,7 +4,7 @@
 KP_DIR ?= ./KernelPatch
 
 # NDK path: use ANDROID_NDK_HOME if NDK_HOME not set
-NDK_HOME ?= $(ANDROID_NDK_HOME)
+NDK_HOME = $(ANDROID_NDK_HOME)
 
 CC  := $(NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang
 STRIP := $(NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
