@@ -51,10 +51,16 @@ jobs:
           echo "=== Section headers ==="
           aarch64-linux-gnu-readelf -S avc_guard.kpm | grep -E '\.kpm|\.symtab|\.strtab'
           echo "=== Relocations (must NOT contain type 283) ==="
-          aarch64-linux-gnu-readelf -r avc_guard.kpm | grep -c '283' && echo "FAIL: type 283 found" || echo "OK: no type 283"
+          count=$(aarch64-linux-gnu-readelf -r avc_guard.kpm | grep -c '283' || true)
+          if [ "$count" -eq 0 ]; then
+            echo "OK: no type 283"
+          else
+            echo "FAIL: type 283 found ($count occurrences)"
+            aarch64-linux-gnu-readelf -r avc_guard.kpm | grep '283'
+            exit 1
+          fi
           echo "=== File info ==="
           file avc_guard.kpm
-          aarch64-linux-gnu-readelf -r avc_guard.kpm | grep '283'
 
       # ── 6. Upload artifact ──
       - name: Upload KPM artifact
