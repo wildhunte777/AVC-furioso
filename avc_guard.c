@@ -2,27 +2,27 @@
 /*
  * avc_guard.c — KernelPatch Module (KPM) for SukiSU
  *
- * Target:  Linux 4.14 arm64 (MT6893 / chopin_kvm)
+ * Target: Linux 4.14 arm64 (MT6893 / chopin_kvm)
  * Purpose: Comprehensive AVC audit and SELinux policy query guard
  */
 
-#include <compiler.h>
 #include <kpmodule.h>
 #include <hook.h>
-#include <syscall.h>
-#include <kputils.h>
-#include <common.h>
-#include <log.h>
 #include <linux/printk.h>
-#include <linux/string.h>
+#include <linux/syscall.h>
+#include <linux/uaccess.h>
 #include <linux/fs.h>
-#include <uapi/asm-generic/unistd.h>
+#include <linux/audit.h>
+#include <kallsyms.h>
+#include <linux/slab.h>
+#include <preset.h>
+
 /* ============================================================================
  * KernelPatch stripped headers forward-declare struct path / struct file.
  * Provide minimal ABI-compatible definitions for Linux 4.14 arm64.
  * ============================================================================ */
 
-struct vfsmount;  /* d_path only dereferences internally; opaque here is fine */
+struct vfsmount; /* d_path only dereferences internally; opaque here is fine */
 struct dentry;
 
 struct path {
@@ -31,7 +31,7 @@ struct path {
 };
 
 struct file {
-    char __f_u_pad[16];         /* union f_u: rcu_head is largest at 16 bytes */
+    char __f_u_pad[16]; /* union f_u: rcu_head is largest at 16 bytes */
     struct path f_path;
     /* Members beyond f_path are not accessed by this module */
 };
@@ -44,50 +44,46 @@ int snprintf(char *buf, size_t size, const char *fmt, ...);
 #define GFP_KERNEL ((unsigned int)0xcc0u)
 #endif
 #ifndef AUDIT_AVC
-#define AUDIT_AVC        1400
+#define AUDIT_AVC 1400
 #endif
 #ifndef AUDIT_USER_AVC
-#define AUDIT_USER_AVC   1107
+#define AUDIT_USER_AVC 1107
 #endif
 #ifndef ENODATA
-#define ENODATA          61
+#define ENODATA 61
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════
- *  kfunc declarations + aliases
- *  kfunc_def(func) expands to (*kf_func), so we alias back to func
- *  ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================================
+ * Function pointer types for runtime-resolved kernel symbols
+ * ============================================================================ */
 
 struct audit_buffer;
 struct audit_context;
 
-struct audit_buffer *kfunc_def(audit_log_start)(struct audit_context *ctx,
-                                                unsigned int gfp_mask,
-                                                int type);
-#define audit_log_start kf_audit_log_start
-
-struct file *kfunc_def(fget)(unsigned int fd);
-#define fget kf_fget
-
-void kfunc_def(fput)(struct file *file);
-#define fput kf_fput
-
-char *kfunc_def(d_path)(const struct path *path, char *buf, int buflen);
-#define d_path kf_d_path
-
-unsigned long kfunc_def(copy_from_user)(void *to, const void __user *from,
+typedef struct audit_buffer *(*audit_log_start_t)(struct audit_context *ctx,
+                                                   unsigned int gfp_mask,
+                                                   int type);
+typedef struct file *(*fget_t)(unsigned int fd);
+typedef void (*fput_t)(struct file *file);
+typedef char *(*d_path_t)(const struct path *path, char *buf, int buflen);
+typedef unsigned long (*copy_from_user_t)(void *to, const void __user *from,
+                                          unsigned long n);
+typedef unsigned long (*copy_to_user_t)(void __user *to, const void *from,
                                         unsigned long n);
-#define copy_from_user kf_copy_from_user
+typedef void *(*kmalloc_t)(size_t size, unsigned int flags);
+typedef void (*kfree_t)(const void *ptr);
 
-unsigned long kfunc_def(copy_to_user)(void __user *to, const void *from,
-                                      unsigned long n);
-#define copy_to_user kf_copy_to_user
-
-void *kfunc_def(kmalloc)(size_t size, unsigned int flags);
-#define kmalloc kf_kmalloc
-
-void kfunc_def(kfree)(const void *ptr);
-#define kfree kf_kfree
+/* ============================================================================
+ * Runtime-resolved function pointers (resolved in avc_guard_init)
+ * ============================================================================ */
+static audit_log_start_t fn_audit_log_start = NULL;
+static fget_t fn_fget = NULL;
+static fput_t fn_fput = NULL;
+static d_path_t fn_d_path = NULL;
+static copy_from_user_t fn_copy_from_user = NULL;
+static copy_to_user_t fn_copy_to_user = NULL;
+static kmalloc_t fn_kmalloc = NULL;
+static kfree_t fn_kfree = NULL;
 
 /* iovec */
 struct kpm_iovec {
@@ -111,9 +107,9 @@ struct kpm_msghdr {
 #define SANITIZE_MAX_LEN 4096
 #define QUERY_BUF_MAX 512
 
-/* ═══════════════════════════════════════════════════════════════════
- *  Dirty context / keyword / path tables
- *  ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================================
+ * Dirty context / keyword / path tables
+ * ============================================================================ */
 
 static const char *dirty_contexts[] = {
     "u:r:ksu", "u:r:su", "u:r:magisk", "u:r:lsposed", "u:r:zygisk",
@@ -179,9 +175,9 @@ static const char *adb_paths[] = {
     NULL
 };
 
-/* ═══════════════════════════════════════════════════════════════════
- *  Module state
- *  ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================================
+ * Module state
+ * ============================================================================ */
 static bool g_l1_ok = false;
 static bool g_l2_read_ok = false;
 static bool g_l2_pread64_ok = false;
@@ -195,9 +191,9 @@ static bool g_l4_getxattr_ok = false;
 static bool g_l4_lgetxattr_ok = false;
 static bool g_l4_fgetxattr_ok = false;
 
-/* ═══════════════════════════════════════════════════════════════════
- *  Common helpers
- *  ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================================
+ * Common helpers
+ * ============================================================================ */
 
 static const char *kstrnstr(const char *s, const char *needle, size_t len)
 {
@@ -231,11 +227,11 @@ static bool is_log_source_fd(int fd)
     int i;
     bool hit = false;
 
-    if (!fget || !fput || !d_path) return false;
-    file = fget(fd);
+    if (!fn_fget || !fn_fput || !fn_d_path) return false;
+    file = fn_fget(fd);
     if (!file) return false;
 
-    path_ptr = d_path(&file->f_path, buf, sizeof(buf));
+    path_ptr = fn_d_path(&file->f_path, buf, sizeof(buf));
     if (path_ptr) {
         for (i = 0; log_source_paths[i]; i++) {
             if (kstrnstr(path_ptr, log_source_paths[i], sizeof(buf))) {
@@ -250,7 +246,7 @@ static bool is_log_source_fd(int fd)
         }
     }
 out:
-    fput(file);
+    fn_fput(file);
     return hit;
 }
 
@@ -263,11 +259,11 @@ static bool is_selinux_query_fd(int fd)
     int i;
     bool hit = false;
 
-    if (!fget || !fput || !d_path) return false;
-    file = fget(fd);
+    if (!fn_fget || !fn_fput || !fn_d_path) return false;
+    file = fn_fget(fd);
     if (!file) return false;
 
-    path_ptr = d_path(&file->f_path, buf, sizeof(buf));
+    path_ptr = fn_d_path(&file->f_path, buf, sizeof(buf));
     if (path_ptr) {
         for (i = 0; selinux_query_paths[i]; i++) {
             if (kstrnstr(path_ptr, selinux_query_paths[i], sizeof(buf))) {
@@ -282,7 +278,7 @@ static bool is_selinux_query_fd(int fd)
         }
     }
 out:
-    fput(file);
+    fn_fput(file);
     return hit;
 }
 
@@ -316,9 +312,9 @@ static bool contains_sensitive(const char *buf, size_t len)
     return false;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- *  Layer 2: sanitize user-space buffer
- *  ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================================
+ * Layer 2: sanitize user-space buffer
+ * ============================================================================ */
 
 static void sanitize_buffer(char __user *user_buf, ssize_t len)
 {
@@ -328,16 +324,16 @@ static void sanitize_buffer(char __user *user_buf, ssize_t len)
     unsigned long not_copied;
 
     if (len <= 0 || len > SANITIZE_MAX_LEN) return;
-    if (!kmalloc || !kfree || !copy_from_user || !copy_to_user) return;
+    if (!fn_kmalloc || !fn_kfree || !fn_copy_from_user || !fn_copy_to_user) return;
 
-    kbuf = kmalloc(len + 1, GFP_KERNEL);
+    kbuf = fn_kmalloc(len + 1, GFP_KERNEL);
     if (!kbuf) return;
 
-    not_copied = copy_from_user(kbuf, user_buf, len);
-    if (not_copied) { kfree(kbuf); return; }
+    not_copied = fn_copy_from_user(kbuf, user_buf, len);
+    if (not_copied) { fn_kfree(kbuf); return; }
     kbuf[len] = '\0';
 
-    if (!contains_sensitive(kbuf, len)) { kfree(kbuf); return; }
+    if (!contains_sensitive(kbuf, len)) { fn_kfree(kbuf); return; }
 
     p = kbuf; end = kbuf + len;
     while (p < end) {
@@ -358,18 +354,18 @@ static void sanitize_buffer(char __user *user_buf, ssize_t len)
     }
 
     if (dirty) {
-        not_copied = copy_to_user(user_buf, kbuf, len);
+        not_copied = fn_copy_to_user(user_buf, kbuf, len);
         if (not_copied) {
             logkw("avc_guard: copy_to_user partial %lu/%ld\n",
                   not_copied, (long)len);
         }
     }
-    kfree(kbuf);
+    fn_kfree(kbuf);
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- *  Layer 1: audit_log_start hook
- *  ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================================
+ * Layer 1: audit_log_start hook
+ * ============================================================================ */
 
 static void before_audit_log_start(hook_fargs3_t *args, void *udata)
 {
@@ -380,9 +376,9 @@ static void before_audit_log_start(hook_fargs3_t *args, void *udata)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- *  Layer 2: read / pread64 / readv / preadv / recvmsg hooks
- *  ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================================
+ * Layer 2: read / pread64 / readv / preadv / recvmsg hooks
+ * ============================================================================ */
 
 static void after_read(hook_fargs3_t *args, void *udata)
 {
@@ -413,10 +409,10 @@ static void after_readv(hook_fargs3_t *args, void *udata)
 
     if (ret <= 0 || !is_log_source_fd(fd)) return;
     if (!uiov || iovcnt <= 0) return;
-    if (!copy_from_user) return;
+    if (!fn_copy_from_user) return;
 
     for (i = 0; i < iovcnt && i < KPM_UIO_MAXIOV; i++) {
-        if (copy_from_user(&kiov, &uiov[i], sizeof(kiov))) continue;
+        if (fn_copy_from_user(&kiov, &uiov[i], sizeof(kiov))) continue;
         if (kiov.iov_base && kiov.iov_len > 0)
             sanitize_buffer(kiov.iov_base, (ssize_t)kiov.iov_len);
     }
@@ -431,29 +427,29 @@ static void after_recvmsg(hook_fargs3_t *args, void *udata)
     int i;
 
     if (ret <= 0) return;
-    if (!copy_from_user) return;
+    if (!fn_copy_from_user) return;
 
     umsg = (struct kpm_msghdr __user *)syscall_argn(args, 1);
     if (!umsg) return;
 
-    if (copy_from_user(&kmsg, umsg, sizeof(kmsg))) return;
+    if (fn_copy_from_user(&kmsg, umsg, sizeof(kmsg))) return;
     if (!kmsg.msg_iov || kmsg.msg_iovlen == 0) return;
 
     for (i = 0; i < (int)kmsg.msg_iovlen && i < KPM_UIO_MAXIOV; i++) {
-        if (copy_from_user(&kiov, &kmsg.msg_iov[i], sizeof(kiov))) continue;
+        if (fn_copy_from_user(&kiov, &kmsg.msg_iov[i], sizeof(kiov))) continue;
         if (!kiov.iov_base || kiov.iov_len == 0) continue;
 
         char quick[256];
         size_t quick_len = kiov.iov_len < sizeof(quick) ? kiov.iov_len : sizeof(quick);
-        if (copy_from_user(quick, kiov.iov_base, quick_len)) continue;
+        if (fn_copy_from_user(quick, kiov.iov_base, quick_len)) continue;
         if (contains_sensitive(quick, quick_len))
             sanitize_buffer(kiov.iov_base, (ssize_t)kiov.iov_len);
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- *  Layer 3: write / writev / pwritev hooks
- *  ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================================
+ * Layer 3: write / writev / pwritev hooks
+ * ============================================================================ */
 
 static void before_write(hook_fargs3_t *args, void *udata)
 {
@@ -466,10 +462,10 @@ static void before_write(hook_fargs3_t *args, void *udata)
 
     if (fd <= 2 || !ubuf || count < 5) return;
     if (!is_selinux_query_fd(fd)) return;
-    if (!copy_from_user) return;
+    if (!fn_copy_from_user) return;
 
     copy_len = (count < QUERY_BUF_MAX - 1) ? count : QUERY_BUF_MAX - 1;
-    not_copied = copy_from_user(kbuf, ubuf, copy_len);
+    not_copied = fn_copy_from_user(kbuf, ubuf, copy_len);
     if (not_copied) return;
     kbuf[copy_len] = '\0';
 
@@ -494,16 +490,16 @@ static void before_writev(hook_fargs3_t *args, void *udata)
 
     if (fd <= 2 || !uiov || iovcnt <= 0) return;
     if (!is_selinux_query_fd(fd)) return;
-    if (!copy_from_user) return;
+    if (!fn_copy_from_user) return;
 
     for (i = 0; i < iovcnt && i < KPM_UIO_MAXIOV; i++) {
-        if (copy_from_user(&kiov, &uiov[i], sizeof(kiov))) continue;
+        if (fn_copy_from_user(&kiov, &uiov[i], sizeof(kiov))) continue;
         if (kiov.iov_base && kiov.iov_len > 0)
             total += kiov.iov_len;
 
         if (!blocked && kiov.iov_base && kiov.iov_len >= 5) {
             copy_len = (kiov.iov_len < QUERY_BUF_MAX - 1) ? kiov.iov_len : QUERY_BUF_MAX - 1;
-            not_copied = copy_from_user(kbuf, kiov.iov_base, copy_len);
+            not_copied = fn_copy_from_user(kbuf, kiov.iov_base, copy_len);
             if (not_copied) continue;
             kbuf[copy_len] = '\0';
             if (contains_dirty_context(kbuf, copy_len))
@@ -517,9 +513,9 @@ static void before_writev(hook_fargs3_t *args, void *udata)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- *  Layer 4: getxattr / lgetxattr / fgetxattr hooks
- *  ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================================
+ * Layer 4: getxattr / lgetxattr / fgetxattr hooks
+ * ============================================================================ */
 
 static void before_getxattr(hook_fargs4_t *args, void *udata)
 {
@@ -528,12 +524,12 @@ static void before_getxattr(hook_fargs4_t *args, void *udata)
     char name_buf[32] = {0};
     char path_buf[256] = {0};
 
-    if (!upath || !uname || !copy_from_user) return;
+    if (!upath || !uname || !fn_copy_from_user) return;
 
-    if (copy_from_user(name_buf, uname, sizeof(name_buf) - 1) != 0) return;
+    if (fn_copy_from_user(name_buf, uname, sizeof(name_buf) - 1) != 0) return;
     if (strcmp(name_buf, "security.selinux") != 0) return;
 
-    if (copy_from_user(path_buf, upath, sizeof(path_buf) - 1) != 0) return;
+    if (fn_copy_from_user(path_buf, upath, sizeof(path_buf) - 1) != 0) return;
     if (!is_sensitive_adb_path(path_buf)) return;
 
     args->skip_origin = 1;
@@ -547,12 +543,12 @@ static void before_lgetxattr(hook_fargs4_t *args, void *udata)
     char name_buf[32] = {0};
     char path_buf[256] = {0};
 
-    if (!upath || !uname || !copy_from_user) return;
+    if (!upath || !uname || !fn_copy_from_user) return;
 
-    if (copy_from_user(name_buf, uname, sizeof(name_buf) - 1) != 0) return;
+    if (fn_copy_from_user(name_buf, uname, sizeof(name_buf) - 1) != 0) return;
     if (strcmp(name_buf, "security.selinux") != 0) return;
 
-    if (copy_from_user(path_buf, upath, sizeof(path_buf) - 1) != 0) return;
+    if (fn_copy_from_user(path_buf, upath, sizeof(path_buf) - 1) != 0) return;
     if (!is_sensitive_adb_path(path_buf)) return;
 
     args->skip_origin = 1;
@@ -568,16 +564,16 @@ static void before_fgetxattr(hook_fargs4_t *args, void *udata)
     char *path_ptr;
     struct file *file;
 
-    if (fd <= 2 || !uname || !copy_from_user || !fget || !fput || !d_path)
+    if (fd <= 2 || !uname || !fn_copy_from_user || !fn_fget || !fn_fput || !fn_d_path)
         return;
 
-    if (copy_from_user(name_buf, uname, sizeof(name_buf) - 1) != 0) return;
+    if (fn_copy_from_user(name_buf, uname, sizeof(name_buf) - 1) != 0) return;
     if (strcmp(name_buf, "security.selinux") != 0) return;
 
-    file = fget(fd);
+    file = fn_fget(fd);
     if (!file) return;
-    path_ptr = d_path(&file->f_path, path_buf, sizeof(path_buf));
-    fput(file);
+    path_ptr = fn_d_path(&file->f_path, path_buf, sizeof(path_buf));
+    fn_fput(file);
 
     if (path_ptr && is_sensitive_adb_path(path_ptr)) {
         args->skip_origin = 1;
@@ -585,9 +581,9 @@ static void before_fgetxattr(hook_fargs4_t *args, void *udata)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- *  Init / Control0 / Exit
- *  ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================================
+ * Init / Control0 / Exit
+ * ============================================================================ */
 
 static long avc_guard_init(const char *args, const char *event,
                            void *__user reserved)
@@ -596,24 +592,22 @@ static long avc_guard_init(const char *args, const char *event,
 
     logkd("avc_guard: v2.2.1 init (kpver=%x kver=%x)\n", kpver, kver);
 
-    if (!audit_log_start)
-        audit_log_start = (void *)kallsyms_lookup_name("audit_log_start");
-    if (!fget) fget = (void *)kallsyms_lookup_name("fget");
-    if (!fput) fput = (void *)kallsyms_lookup_name("fput");
-    if (!d_path) d_path = (void *)kallsyms_lookup_name("d_path");
-    if (!copy_from_user)
-        copy_from_user = (void *)kallsyms_lookup_name("copy_from_user");
-    if (!copy_to_user)
-        copy_to_user = (void *)kallsyms_lookup_name("copy_to_user");
-    if (!kmalloc) kmalloc = (void *)kallsyms_lookup_name("kmalloc");
-    if (!kfree) kfree = (void *)kallsyms_lookup_name("kfree");
+    /* Resolve all kernel symbols at runtime — zero external relocations */
+    fn_audit_log_start = (audit_log_start_t)kallsyms_lookup_name("audit_log_start");
+    fn_fget = (fget_t)kallsyms_lookup_name("fget");
+    fn_fput = (fput_t)kallsyms_lookup_name("fput");
+    fn_d_path = (d_path_t)kallsyms_lookup_name("d_path");
+    fn_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("copy_from_user");
+    fn_copy_to_user = (copy_to_user_t)kallsyms_lookup_name("copy_to_user");
+    fn_kmalloc = (kmalloc_t)kallsyms_lookup_name("kmalloc");
+    fn_kfree = (kfree_t)kallsyms_lookup_name("kfree");
 
     /* L1 */
-    if (audit_log_start) {
-        err = hook_wrap3(audit_log_start, before_audit_log_start, NULL, 0);
+    if (fn_audit_log_start) {
+        err = hook_wrap3(fn_audit_log_start, before_audit_log_start, NULL, 0);
         if (err == HOOK_NO_ERR) {
             g_l1_ok = true;
-            logkd("avc_guard: L1 hooked audit_log_start@%p\n", audit_log_start);
+            logkd("avc_guard: L1 hooked audit_log_start@%p\n", fn_audit_log_start);
         } else {
             logkw("avc_guard: L1 hook failed err=%d\n", err);
         }
@@ -693,31 +687,31 @@ static long avc_guard_control0(const char *args, char *__user out_msg,
     size_t copy_len;
 
     len = snprintf(msg, sizeof(msg),
-                   "avc_guard v2.2.1 status:\n"
-                   "  L1 audit_log_start : %s\n"
-                   "  L2 read            : %s\n"
-                   "  L2 pread64         : %s\n"
-                   "  L2 readv           : %s\n"
-                   "  L2 preadv          : %s\n"
-                   "  L2 recvmsg         : %s\n"
-                   "  L3 write           : %s\n"
-                   "  L3 writev          : %s\n"
-                   "  L3 pwritev         : %s\n"
-                   "  L4 getxattr        : %s\n"
-                   "  L4 lgetxattr       : %s\n"
-                   "  L4 fgetxattr       : %s\n",
-                   g_l1_ok ? "OK" : "FAIL",
-                   g_l2_read_ok ? "OK" : "FAIL",
-                   g_l2_pread64_ok ? "OK" : "FAIL",
-                   g_l2_readv_ok ? "OK" : "FAIL",
-                   g_l2_preadv_ok ? "OK" : "FAIL",
-                   g_l2_recvmsg_ok ? "OK" : "FAIL",
-                   g_l3_write_ok ? "OK" : "FAIL",
-                   g_l3_writev_ok ? "OK" : "FAIL",
-                   g_l3_pwritev_ok ? "OK" : "FAIL",
-                   g_l4_getxattr_ok ? "OK" : "FAIL",
-                   g_l4_lgetxattr_ok ? "OK" : "FAIL",
-                   g_l4_fgetxattr_ok ? "OK" : "FAIL");
+        "avc_guard v2.2.1 status:\n"
+        " L1 audit_log_start : %s\n"
+        " L2 read            : %s\n"
+        " L2 pread64         : %s\n"
+        " L2 readv           : %s\n"
+        " L2 preadv          : %s\n"
+        " L2 recvmsg         : %s\n"
+        " L3 write           : %s\n"
+        " L3 writev          : %s\n"
+        " L3 pwritev         : %s\n"
+        " L4 getxattr        : %s\n"
+        " L4 lgetxattr       : %s\n"
+        " L4 fgetxattr       : %s\n",
+        g_l1_ok ? "OK" : "FAIL",
+        g_l2_read_ok ? "OK" : "FAIL",
+        g_l2_pread64_ok ? "OK" : "FAIL",
+        g_l2_readv_ok ? "OK" : "FAIL",
+        g_l2_preadv_ok ? "OK" : "FAIL",
+        g_l2_recvmsg_ok ? "OK" : "FAIL",
+        g_l3_write_ok ? "OK" : "FAIL",
+        g_l3_writev_ok ? "OK" : "FAIL",
+        g_l3_pwritev_ok ? "OK" : "FAIL",
+        g_l4_getxattr_ok ? "OK" : "FAIL",
+        g_l4_lgetxattr_ok ? "OK" : "FAIL",
+        g_l4_fgetxattr_ok ? "OK" : "FAIL");
 
     if (out_msg && outlen > 0) {
         copy_len = (size_t)(len + 1) < (size_t)outlen ? (size_t)(len + 1) : (size_t)outlen;
@@ -730,8 +724,8 @@ static long avc_guard_exit(void *__user reserved)
 {
     logkd("avc_guard: exiting\n");
 
-    if (g_l1_ok && audit_log_start)
-        hook_unwrap(audit_log_start, before_audit_log_start, NULL);
+    if (g_l1_ok && fn_audit_log_start)
+        hook_unwrap(fn_audit_log_start, before_audit_log_start, NULL);
 
     if (g_l2_read_ok)
         fp_unhook_syscalln(__NR_read, NULL, after_read);
