@@ -18,25 +18,26 @@
 #include <linux/fs.h>
 #include <uapi/asm-generic/unistd.h>
 /* ============================================================================
- * KernelPatch stripped headers forward-declare struct file.
- * Provide a minimal definition for Linux 4.14 arm64, sufficient for
- * f_path access. Layout verified against linux-4.14.y/fs.h:
- *   offset 0x00 : union f_u (rcu_head max 16 bytes)
- *   offset 0x10 : struct path f_path
+ * KernelPatch stripped headers forward-declare struct path / struct file.
+ * Provide minimal ABI-compatible definitions for Linux 4.14 arm64.
  * ============================================================================ */
-struct file {
-    char __f_u_pad[16];         /* union { llist_node(8) | rcu_head(16) } */
-    struct path f_path;
+
+struct vfsmount;  /* d_path only dereferences internally; opaque here is fine */
+struct dentry;
+
+struct path {
+    struct vfsmount *mnt;
+    struct dentry *dentry;
 };
 
-/* KernelPatch headers lack snprintf prototype; declare manually */
+struct file {
+    char __f_u_pad[16];         /* union f_u: rcu_head is largest at 16 bytes */
+    struct path f_path;
+    /* Members beyond f_path are not accessed by this module */
+};
+
+/* KernelPatch headers lack stdio prototypes; declare manually */
 int snprintf(char *buf, size_t size, const char *fmt, ...);
-/* KPM metadata */
-KPM_NAME("avc_guard");
-KPM_VERSION("2.2.1");
-KPM_LICENSE("GPL v2");
-KPM_AUTHOR("ai-assisted");
-KPM_DESCRIPTION("Comprehensive AVC and SELinux policy query guard");
 
 /* Fallbacks */
 #ifndef GFP_KERNEL
