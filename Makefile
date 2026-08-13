@@ -5,6 +5,8 @@ KP_DIR ?= ./KernelPatch
 NDK_HOME ?= $(ANDROID_NDK_HOME)
 
 CC := $(NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang
+CC  := $(NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang
+STRIP := $(NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
 
 INC := -I$(KP_DIR)/kernel/include \
        -I$(KP_DIR)/kernel/patch/include \
@@ -27,7 +29,7 @@ all: $(TARGET)
 
 $(TARGET): $(OBJ)
 	$(CC) -r -nostdlib -no-pie -o $@ $^
-	$(CC:%clang=%llvm-strip) --strip-debug \
+		$(STRIP) --strip-debug \
 	  --remove-section=.comment \
 	  --remove-section=.note.GNU-stack \
 	  $@
