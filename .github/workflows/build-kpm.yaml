@@ -1,0 +1,94 @@
+name: Build avc_guard KPM
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'avc_guard.c'
+      - 'avc_guard.lds'
+      - 'Makefile'
+      - '.github/workflows/build-kpm.yml'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  NDK_VERSION: r25c
+  NDK_ZIP: android-ndk-r25c-linux.zip
+  NDK_URL: https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+  KP_REPO: https://github.com/ShirkNeko/SukiSU_KernelPatch_patch.git
+
+jobs:
+  build-kpm:
+    runs-on: ubuntu-latest
+    steps:
+      # ── 1. Checkout source ──
+      - name: Checkout KPM source
+        uses: actions/checkout@v4
+
+      # ── 2. Cache NDK (robustness fix) ──
+      - name: Cache Android NDK
+        uses: actions/cache@v4
+        id: ndk-cache
+        with:
+          path: ${{ env.NDK_ZIP }}
+          key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}-${{ hashFiles('.github/workflows/build-kpm.yml') }}
+
+      - name: Download Android NDK
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          wget -q --show-progress ${{ env.NDK_URL }} -O ${{ env.NDK_ZIP }}
+
+      - name: Extract Android NDK
+        run: |
+          unzip -q ${{ env.NDK_ZIP }}
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+          $PWD/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang --version | head -1
+
+      # ── 3. Clone KernelPatch headers only (no kernel source) ──
+      - name: Clone SukiSU KernelPatch
+        run: |
+          git clone --depth=1 ${{ env.KP_REPO }} KernelPatch
+          echo "KernelPatch HEAD: $(git -C KernelPatch rev-parse --short HEAD)"
+          # Verify expected directories exist
+          test -d KernelPatch/kernel/include || { echo "Missing kernel/include"; exit 1; }
+          test -d KernelPatch/kernel/patch/include || { echo "Missing kernel/patch/include"; exit 1; }
+          test -d KernelPatch/kernel/linux/include || { echo "Missing kernel/linux/include"; exit 1; }
+
+      # ── 4. Build KPM ──
+      - name: Build avc_guard.kpm
+        run: |
+          make KP_DIR=./KernelPatch NDK_PATH=${{ env.ANDROID_NDK_HOME }} -j$(nproc)
+
+      # ── 5. Validate KPM structure ──
+      - name: Validate KPM sections
+        run: |
+          echo "=== Section headers ==="
+          ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -S avc_guard.kpm | grep -E '\.kpm|\.text|\.rodata'
+          echo "=== Symbol table (kpm callbacks) ==="
+          ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -s avc_guard.kpm | grep -E 'kpm|init|exit' || true
+          echo "=== File type ==="
+          file avc_guard.kpm
+
+      # ── 6. Upload artifact ──
+      - name: Upload KPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: avc_guard-${{ github.run_number }}-${{ github.sha }}
+          path: avc_guard.kpm
+          retention-days: 30
+
+      # ── 7. Release on tag ──
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: avc_guard.kpm
+          body: |
+            **avc_guard KPM**
+            - Target: Linux 4.14+ arm64 (MT6893 / generic)
+            - KernelPatch: [SukiSU-Ultra/SukiSU_KernelPatch_patch](${{ env.KP_REPO }})
+            - NDK: ${{ env.NDK_VERSION }}
+            - Build: ${{ github.run_number }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
