@@ -17,7 +17,20 @@
 #include <linux/string.h>
 #include <linux/fs.h>
 #include <uapi/asm-generic/unistd.h>
+/* ============================================================================
+ * KernelPatch stripped headers forward-declare struct file.
+ * Provide a minimal definition for Linux 4.14 arm64, sufficient for
+ * f_path access. Layout verified against linux-4.14.y/fs.h:
+ *   offset 0x00 : union f_u (rcu_head max 16 bytes)
+ *   offset 0x10 : struct path f_path
+ * ============================================================================ */
+struct file {
+    char __f_u_pad[16];         /* union { llist_node(8) | rcu_head(16) } */
+    struct path f_path;
+};
 
+/* KernelPatch headers lack snprintf prototype; declare manually */
+int snprintf(char *buf, size_t size, const char *fmt, ...);
 /* KPM metadata */
 KPM_NAME("avc_guard");
 KPM_VERSION("2.2.1");
