@@ -35,6 +35,7 @@ INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(dir))
 
 CFLAGS := -Wall -O2 -g \
   -mcmodel=large \
+  -mno-relax-all \
   -fno-PIC -fno-pie \
   -fno-asynchronous-unwind-tables \
   -fno-stack-protector \
