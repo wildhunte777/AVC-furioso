@@ -1,12 +1,11 @@
 # Makefile for avc_guard.kpm
-# Based on dsp_bypass's proven build config
+# Use GCC to avoid Clang's ADRP generation for extern symbols
 
 KP_DIR ?= ./KernelPatch
-NDK_HOME ?= $(ANDROID_NDK_HOME)
 
-CC := $(NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang
-CC  := $(NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang
-STRIP := $(NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
+CC  := aarch64-linux-gnu-gcc
+LD  := aarch64-linux-gnu-ld
+STRIP := aarch64-linux-gnu-strip
 
 INC := -I$(KP_DIR)/kernel/include \
        -I$(KP_DIR)/kernel/patch/include \
@@ -28,8 +27,8 @@ OBJ := avc_guard.o
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
-	$(CC) -r -nostdlib -no-pie -o $@ $^
-		$(STRIP) --strip-debug \
+	$(LD) -r -nostdlib -o $@ $^
+	$(STRIP) --strip-debug \
 	  --remove-section=.comment \
 	  --remove-section=.note.GNU-stack \
 	  $@
