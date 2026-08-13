@@ -1,74 +1,41 @@
 # Makefile for avc_guard.kpm
-# Target: Linux 3.18+ arm64 (validated on 4.14 MT6893)
+# Based on dsp_bypass's proven build config
 
-ifeq ($(OS), Windows_NT)
-  PLATFORM := windows-x86_64
-else
-  PLATFORM := linux-x86_64
-endif
+KP_DIR ?= ./KernelPatch
+NDK_HOME ?= $(ANDROID_NDK_HOME)
 
-ifndef NDK_PATH
-  NDK_PATH := $(ANDROID_NDK_HOME)
-endif
-ifndef KP_DIR
-  KP_DIR := ../SukiSU_KernelPatch_patch
-endif
+CC := $(NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang
 
-TARGET_COMPILE := $(NDK_PATH)/toolchains/llvm/prebuilt/$(PLATFORM)/bin/
-CC  := $(TARGET_COMPILE)aarch64-linux-android31-clang
-LD  := $(TARGET_COMPILE)ld.lld
-STRIP := $(TARGET_COMPILE)llvm-strip
-READELF := $(TARGET_COMPILE)llvm-readelf
+INC := -I$(KP_DIR)/kernel/include \
+       -I$(KP_DIR)/kernel/patch/include \
+       -I$(KP_DIR)/kernel/patch/include/uapi \
+       -I$(KP_DIR)/kernel/linux/include \
+       -I$(KP_DIR)/kernel/linux/arch/arm64/include \
+       -I$(KP_DIR)/kernel/linux/arch/arm64/include/generated/uapi \
+       -I$(KP_DIR)/kernel/linux/arch/arm64/include/uapi \
+       -I$(KP_DIR)/kernel/linux/include/uapi \
+       -I$(KP_DIR)/kernel/linux/tools/arch/arm64/include
 
-INCLUDE_DIRS := \
-  $(KP_DIR)/kernel/include \
-  $(KP_DIR)/kernel/patch/include \
-  $(KP_DIR)/kernel/patch/include/uapi \
-  $(KP_DIR)/kernel/linux/include \
-  $(KP_DIR)/kernel/linux/arch/arm64/include \
-  $(KP_DIR)/kernel/linux/arch/arm64/include/generated/uapi \
-  $(KP_DIR)/kernel/linux/arch/arm64/include/uapi \
-  $(KP_DIR)/kernel/linux/include/uapi \
-  $(KP_DIR)/kernel/linux/tools/arch/arm64/include
-
-INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(dir))
-
-CFLAGS := -Wall -O2 -g \
-  -fPIC \
-  -fno-pie \
-  -fno-asynchronous-unwind-tables \
-  -fno-stack-protector \
-  -fno-unwind-tables \
-  -fno-semantic-interposition \
-  -fno-common \
-  -fvisibility=hidden \
-  -U_FORTIFY_SOURCE \
-  $(INCLUDE_FLAGS) \
-  -DKP_MODULE
-
-LDFLAGS := -r -nostdlib -no-pie
+CFLAGS := -O2 -Wall -nostdinc -ffreestanding -fno-stack-protector \
+          -fno-pic -fno-pie -fno-common -mgeneral-regs-only \
+          -DKP_MODULE
 
 TARGET := avc_guard.kpm
-OBJS   := avc_guard.o
-
-.PHONY: all clean check
+OBJ := avc_guard.o
 
 all: $(TARGET)
 
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(TARGET): $(OBJS)
-	$(LD) $(LDFLAGS) $^ -o $@
-	$(STRIP) --strip-debug \
+$(TARGET): $(OBJ)
+	$(CC) -r -nostdlib -no-pie -o $@ $^
+	$(CC:%clang=%llvm-strip) --strip-debug \
 	  --remove-section=.comment \
 	  --remove-section=.note.GNU-stack \
 	  $@
-	@echo "=== Built: $@ ==="
-	@echo "=== Section headers (check for SHF_ALLOC on .kpm.*) ==="
-	@$(READELF) -S $@ | grep -E '\.kpm|\.symtab|\.strtab'
-	@echo "=== File info ==="
-	@file $@
+
+%.o: %.c
+	$(CC) $(CFLAGS) $(INC) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f *.o *.kpm
+
+.PHONY: all clean
