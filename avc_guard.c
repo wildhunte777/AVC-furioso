@@ -6,11 +6,6 @@
  * Purpose: Comprehensive AVC audit and SELinux policy query guard
  */
 
-/* kpmodule.h uses __user but doesn't define it — define first */
-#ifndef __user
-#define __user __attribute__((noderef, address_space(1)))
-#endif
-
 #include <kpmodule.h>
 #include <hook.h>
 #include <linux/printk.h>
