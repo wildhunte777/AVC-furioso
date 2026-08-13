@@ -635,7 +635,7 @@ static long avc_guard_init(const char *args, const char *event,
 {
     hook_err_t err;
 
-    logkd("avc_guard: v2.2.1 init (kpver=%x kver=%x)\n", kpver, kver);
+    logkd("avc_guard: v2.2.1 init\n");
 
     /* Resolve all kernel symbols at runtime — zero external relocations */
     fn_audit_log_start = (audit_log_start_t)kallsyms_lookup_name("audit_log_start");
