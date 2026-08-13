@@ -6,6 +6,7 @@
  * Purpose: Comprehensive AVC audit and SELinux policy query guard
  */
 
+#include <compiler.h>
 #include <kpmodule.h>
 #include <hook.h>
 #include <linux/printk.h>
