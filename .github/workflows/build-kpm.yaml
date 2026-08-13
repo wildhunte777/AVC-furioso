@@ -43,7 +43,7 @@ jobs:
       - name: Build avc_guard.kpm
         run: |
           make clean
-          make KP_DIR=./KernelPatch NDK_HOME=${{ env.ANDROID_NDK_HOME }} -j$(nproc)
+          make KP_DIR=./KernelPatch NDK_HOME=/home/runner/work/AVC-furioso/AVC-furioso/android-ndk-r25c -j$(nproc)
 
       # ── 5. Validate KPM structure ──
       - name: Validate KPM sections
