@@ -3,9 +3,9 @@
 
 KP_DIR ?= ./KernelPatch
 
-CC  := aarch64-linux-gnu-gcc
+CC  := $(NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang
 LD  := aarch64-linux-gnu-ld
-STRIP := aarch64-linux-gnu-strip
+STRIP := $(NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
 
 INC := -I$(KP_DIR)/kernel/include \
        -I$(KP_DIR)/kernel/patch/include \
