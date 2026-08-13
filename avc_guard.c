@@ -10,7 +10,8 @@
 #include <hook.h>
 #include <linux/printk.h>
 #include <syscall.h>          /* KernelPatch syscall.h: fp_hook_syscalln, etc. */
-#include <uaccess.h>          /* KernelPatch uaccess.h: compat_copy_to_user */
+/* compat_copy_to_user not exported in this KernelPatch branch; declare manually */
+long compat_copy_to_user(void __user *to, const void *from, unsigned long n);
 #include <kallsyms.h>
 #include <linux/slab.h>
 #include <preset.h>
@@ -36,6 +37,13 @@ struct file {
 
 /* KernelPatch headers lack stdio prototypes; declare manually */
 int snprintf(char *buf, size_t size, const char *fmt, ...);
+
+/* KernelPatch headers lack string prototypes; declare manually */
+unsigned long strlen(const char *s);
+int strcmp(const char *s1, const char *s2);
+int memcmp(const void *s1, const void *s2, size_t n);
+char *strchr(const char *s, int c);
+void *memset(void *s, int c, size_t n);
 
 /* Fallbacks */
 #ifndef GFP_KERNEL
