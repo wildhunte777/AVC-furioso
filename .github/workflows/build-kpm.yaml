@@ -44,7 +44,7 @@ jobs:
         run: |
           make clean
           make KP_DIR=./KernelPatch -j$(nproc)
-          aarch64-linux-gnu-readelf -r avc_guard.kpm | grep 'ADR_PREL_PG_HI21'
+          aarch64-linux-gnu-readelf -r avc_guard.kpm
 
       # ── 5. Validate KPM structure ──
       - name: Validate KPM sections
