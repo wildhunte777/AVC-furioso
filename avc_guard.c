@@ -340,7 +340,8 @@ static bool is_sensitive_adb_path(const char *path)
 /* 不用全局数组，直接在函数内用局部静态或字符串比较链 */
 static bool contains_dirty_context(const char *buf, size_t len)
 {
-    for (i = 0; dirty_contexts[i]; i++) {   // <-- 这里访问 dirty_contexts，生成 ADRP
+     int i;
+    for (i = 0; dirty_contexts[i]; i++) {
         if (kstrnstr(buf, dirty_contexts[i], len))
             return true;
     }
