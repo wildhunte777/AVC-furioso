@@ -6,8 +6,8 @@ on:
     paths:
       - 'avc_guard.c'
       - 'Makefile'
-      - '.github/workflows/build-kpm.yaml'
       - 'avc_guard.lds'
+      - '.github/workflows/build-kpm.yaml'
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -57,8 +57,8 @@ jobs:
         run: |
           export TARGET_COMPILE=aarch64-none-elf-
           export PATH="$(pwd)/${ARM_TOOLCHAIN_NAME}/bin:$PATH"
-          echo "=== Section headers ==="
-          ${TARGET_COMPILE}readelf -S avc_guard.kpm | grep -E '\.kpm|\.symtab|\.strtab|\.text|\.rodata'
+          echo "=== Section layout (should show only .text) ==="
+          ${TARGET_COMPILE}readelf -S avc_guard.kpm | grep -E '\.[a-z]+' | grep -v '.symtab\|.strtab\|.shstrtab\|.rela' || true
           echo ""
           echo "=== Relocation summary ==="
           ${TARGET_COMPILE}readelf -r avc_guard.kpm | head -20
@@ -70,13 +70,10 @@ jobs:
           else
             echo "FAIL: $count ADRP relocations found"
             ${TARGET_COMPILE}readelf -r avc_guard.kpm | grep -E 'ADR_PREL_PG_HI21|283'
-            echo ""
-            echo "Dumping full relocation table for diagnosis..."
-            ${TARGET_COMPILE}readelf -r avc_guard.kpm
             exit 1
           fi
 
-      # ── 6. Diagnosis: disassemble & locate ADRP sources (Scheme 3) ──
+      # ── 6. Diagnosis: disassemble & locate ADRP sources ──
       - name: Diagnose ADRP sources via disassembly
         if: always()
         run: |
@@ -90,34 +87,23 @@ jobs:
           adrp_count=$(${TARGET_COMPILE}objdump -d avc_guard.o | grep -c adrp || true)
           echo "ADRP instructions in avc_guard.o: $adrp_count"
           echo ""
-
           echo "--- 6b. ADRP instructions in final .kpm ---"
           adrp_kpm=$(${TARGET_COMPILE}objdump -d avc_guard.kpm | grep -c adrp || true)
           echo "ADRP instructions in avc_guard.kpm: $adrp_kpm"
           echo ""
-
-          echo "--- 6c. Full disassembly with source lines (first 200 lines) ---"
-          ${TARGET_COMPILE}objdump -S avc_guard.o | head -n 200 || true
+          echo "--- 6c. Section headers (verify merge) ---"
+          ${TARGET_COMPILE}readelf -S avc_guard.kpm
           echo ""
-
-          echo "--- 6d. Extract all ADRP sites with surrounding context ---"
+          echo "--- 6d. Symbol table (section check) ---"
+          ${TARGET_COMPILE}nm avc_guard.kpm | head -n 60
+          echo ""
+          echo "--- 6e. ADRP sites with source lines ---"
           ${TARGET_COMPILE}objdump -S avc_guard.o > avc_guard.disasm.txt
-          grep -n -B 5 -A 5 'adrp' avc_guard.disasm.txt | head -n 200 || echo "No ADRP found in .o"
+          grep -n -B 3 -A 3 'adrp' avc_guard.disasm.txt | head -n 200 || echo "No ADRP found"
           echo ""
-
-          echo "--- 6e. Symbol table (functions & objects) ---"
-          ${TARGET_COMPILE}nm avc_guard.o | head -n 50
+          echo "--- 6f. Relocation types breakdown ---"
+          ${TARGET_COMPILE}readelf -r avc_guard.kpm | awk 'NF>=3 {print $3}' | sort | uniq -c | sort -rn | head -n 20
           echo ""
-
-          echo "--- 6f. Section sizes ---"
-          ${TARGET_COMPILE}size avc_guard.o
-          ${TARGET_COMPILE}size avc_guard.kpm
-          echo ""
-
-          echo "--- 6g. Relocation types breakdown ---"
-          ${TARGET_COMPILE}readelf -r avc_guard.kpm | awk '{print $3}' | sort | uniq -c | sort -rn | head -n 20
-          echo ""
-
           echo "========================================"
           echo "  ADRP audit complete                  "
           echo "========================================"
@@ -132,6 +118,7 @@ jobs:
             avc_guard.kpm
             avc_guard.o
             avc_guard.disasm.txt
+            avc_guard.lds
           retention-days: 30
 
       # ── 8. Release on tag ──
