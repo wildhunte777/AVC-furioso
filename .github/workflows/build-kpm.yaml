@@ -7,13 +7,13 @@ on:
       - 'avc_guard.c'
       - 'Makefile'
       - '.github/workflows/build-kpm.yaml'
+      - 'avc_guard.lds'
   pull_request:
     branches: [main, master]
   workflow_dispatch:
 
 env:
   KP_REPO: https://github.com/ShirkNeko/SukiSU_KernelPatch_patch.git
-  # ARM 裸机工具链版本
   ARM_TOOLCHAIN_VER: 13.3.rel1
   ARM_TOOLCHAIN_NAME: arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf
 
@@ -28,11 +28,12 @@ jobs:
       # ── 2. Install bare-metal GCC cross-compiler ──
       - name: Install aarch64-none-elf toolchain
         run: |
-          wget -q https://developer.arm.com/-/media/Files/downloads/gnu/${ARM_TOOLCHAIN_VER}/binrel/${ARM_TOOLCHAIN_NAME}.tar.xz
+          wget -q "https://developer.arm.com/-/media/Files/downloads/gnu/${ARM_TOOLCHAIN_VER}/binrel/${ARM_TOOLCHAIN_NAME}.tar.xz"
           tar -xf ${ARM_TOOLCHAIN_NAME}.tar.xz
           echo "$(pwd)/${ARM_TOOLCHAIN_NAME}/bin" >> $GITHUB_PATH
-          $(pwd)/${ARM_TOOLCHAIN_NAME}/bin/aarch64-none-elf-gcc --version | head -1
-          $(pwd)/${ARM_TOOLCHAIN_NAME}/bin/aarch64-none-elf-ld --version | head -1
+          export PATH="$(pwd)/${ARM_TOOLCHAIN_NAME}/bin:$PATH"
+          aarch64-none-elf-gcc --version | head -1
+          aarch64-none-elf-ld --version | head -1
 
       # ── 3. Clone KernelPatch headers ──
       - name: Clone SukiSU KernelPatch
@@ -47,37 +48,93 @@ jobs:
       - name: Build avc_guard.kpm
         run: |
           export TARGET_COMPILE=aarch64-none-elf-
+          export PATH="$(pwd)/${ARM_TOOLCHAIN_NAME}/bin:$PATH"
           make clean
           make TARGET_COMPILE=$TARGET_COMPILE KP_DIR=./KernelPatch -j$(nproc)
 
-      # ── 5. Validate KPM structure ──
-      - name: Validate KPM sections & relocations
+      # ── 5. Validate: check ADRP relocations ──
+      - name: Check ADRP relocations
         run: |
           export TARGET_COMPILE=aarch64-none-elf-
+          export PATH="$(pwd)/${ARM_TOOLCHAIN_NAME}/bin:$PATH"
           echo "=== Section headers ==="
-          ${TARGET_COMPILE}readelf -S avc_guard.kpm | grep -E '\.kpm|\.symtab|\.strtab'
-          echo "=== Relocations (must NOT contain ADR_PREL_PG_HI21 / type 283) ==="
-          ${TARGET_COMPILE}readelf -r avc_guard.kpm | grep 'ADR_PREL_PG_HI21\|283' || true
+          ${TARGET_COMPILE}readelf -S avc_guard.kpm | grep -E '\.kpm|\.symtab|\.strtab|\.text|\.rodata'
+          echo ""
+          echo "=== Relocation summary ==="
+          ${TARGET_COMPILE}readelf -r avc_guard.kpm | head -20
+          echo ""
+          echo "=== ADRP relocations (type 283 / ADR_PREL_PG_HI21) ==="
           count=$(${TARGET_COMPILE}readelf -r avc_guard.kpm | grep -cE 'ADR_PREL_PG_HI21|283' || true)
           if [ "$count" -eq 0 ]; then
-            echo "OK: no ADRP relocations"
+            echo "OK: no ADRP relocations found"
           else
             echo "FAIL: $count ADRP relocations found"
             ${TARGET_COMPILE}readelf -r avc_guard.kpm | grep -E 'ADR_PREL_PG_HI21|283'
+            echo ""
+            echo "Dumping full relocation table for diagnosis..."
+            ${TARGET_COMPILE}readelf -r avc_guard.kpm
             exit 1
           fi
-          echo "=== File info ==="
-          file avc_guard.kpm
 
-      # ── 6. Upload artifact ──
-      - name: Upload KPM artifact
+      # ── 6. Diagnosis: disassemble & locate ADRP sources (Scheme 3) ──
+      - name: Diagnose ADRP sources via disassembly
+        if: always()
+        run: |
+          export TARGET_COMPILE=aarch64-none-elf-
+          export PATH="$(pwd)/${ARM_TOOLCHAIN_NAME}/bin:$PATH"
+          echo "========================================"
+          echo "  ADRP INSTRUCTION AUDIT (Scheme 3)   "
+          echo "========================================"
+          echo ""
+          echo "--- 6a. ADRP instruction count in .o ---"
+          adrp_count=$(${TARGET_COMPILE}objdump -d avc_guard.o | grep -c adrp || true)
+          echo "ADRP instructions in avc_guard.o: $adrp_count"
+          echo ""
+
+          echo "--- 6b. ADRP instructions in final .kpm ---"
+          adrp_kpm=$(${TARGET_COMPILE}objdump -d avc_guard.kpm | grep -c adrp || true)
+          echo "ADRP instructions in avc_guard.kpm: $adrp_kpm"
+          echo ""
+
+          echo "--- 6c. Full disassembly with source lines (first 200 lines) ---"
+          ${TARGET_COMPILE}objdump -S avc_guard.o | head -n 200 || true
+          echo ""
+
+          echo "--- 6d. Extract all ADRP sites with surrounding context ---"
+          ${TARGET_COMPILE}objdump -S avc_guard.o > avc_guard.disasm.txt
+          grep -n -B 5 -A 5 'adrp' avc_guard.disasm.txt | head -n 200 || echo "No ADRP found in .o"
+          echo ""
+
+          echo "--- 6e. Symbol table (functions & objects) ---"
+          ${TARGET_COMPILE}nm avc_guard.o | head -n 50
+          echo ""
+
+          echo "--- 6f. Section sizes ---"
+          ${TARGET_COMPILE}size avc_guard.o
+          ${TARGET_COMPILE}size avc_guard.kpm
+          echo ""
+
+          echo "--- 6g. Relocation types breakdown ---"
+          ${TARGET_COMPILE}readelf -r avc_guard.kpm | awk '{print $3}' | sort | uniq -c | sort -rn | head -n 20
+          echo ""
+
+          echo "========================================"
+          echo "  ADRP audit complete                  "
+          echo "========================================"
+
+      # ── 7. Upload diagnosis artifacts ──
+      - name: Upload diagnosis artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: avc_guard-${{ github.run_number }}-${{ github.sha }}
-          path: avc_guard.kpm
+          name: avc_guard-diagnosis-${{ github.run_number }}-${{ github.sha }}
+          path: |
+            avc_guard.kpm
+            avc_guard.o
+            avc_guard.disasm.txt
           retention-days: 30
 
-      # ── 7. Release on tag ──
+      # ── 8. Release on tag ──
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v1
@@ -85,7 +142,7 @@ jobs:
           files: avc_guard.kpm
           body: |
             **avc_guard KPM**
-            - Target: Linux 4.14+ arm64 (MT6893 / generic)
+            - Target: Linux 4.14+ arm64 (SukiSU / KernelPatch)
             - KernelPatch: [SukiSU-Ultra/SukiSU_KernelPatch_patch](${{ env.KP_REPO }})
             - Compiler: GCC aarch64-none-elf
             - Build: ${{ github.run_number }}
