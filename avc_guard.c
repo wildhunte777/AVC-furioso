@@ -337,13 +337,26 @@ static bool is_sensitive_adb_path(const char *path)
     return false;
 }
 
+/* 不用全局数组，直接在函数内用局部静态或字符串比较链 */
 static bool contains_dirty_context(const char *buf, size_t len)
 {
-    int i;
-    for (i = 0; dirty_contexts[i]; i++) {
-        if (kstrnstr(buf, dirty_contexts[i], len))
-            return true;
-    }
+    /* 编译器会把这些字符串字面量内联到代码中，用 ADR（±1MB）或绝对寻址 */
+    if (kstrnstr(buf, "u:r:ksu", len)) return true;
+    if (kstrnstr(buf, "u:r:su", len)) return true;
+    if (kstrnstr(buf, "u:r:magisk", len)) return true;
+    if (kstrnstr(buf, "u:r:lsposed", len)) return true;
+    if (kstrnstr(buf, "u:r:zygisk", len)) return true;
+    if (kstrnstr(buf, "u:r:apatch", len)) return true;
+    if (kstrnstr(buf, "u:r:sukisu", len)) return true;
+    if (kstrnstr(buf, "u:r:supersu", len)) return true;
+    if (kstrnstr(buf, "u:r:root", len)) return true;
+    if (kstrnstr(buf, "u:object_r:magisk", len)) return true;
+    if (kstrnstr(buf, "u:object_r:ksu", len)) return true;
+    if (kstrnstr(buf, "u:object_r:lsposed", len)) return true;
+    if (kstrnstr(buf, "u:object_r:zygisk", len)) return true;
+    if (kstrnstr(buf, "u:object_r:apatch", len)) return true;
+    if (kstrnstr(buf, "u:object_r:sukisu", len)) return true;
+    if (kstrnstr(buf, "u:object_r:supersu", len)) return true;
     return false;
 }
 
